@@ -1,0 +1,259 @@
+{
+    "python.languageServer": "None",
+    "editor.semanticHighlighting.enabled": true,
+    "editor.inlayHints.enabled": "off",
+    // Semantic token customizations (basedpyright semantic tokens)
+    "editor.semanticTokenColorCustomizations": {
+        "rules": {
+            // Classes and types
+            "class": "#4EC9B0",
+            "class.declaration": "#4EC9B0",
+            "*.class": "#4EC9B0",
+            "type": "#4EC9B0",
+            "type.declaration": "#4EC9B0",
+            "*.type": "#4EC9B0",
+            "typeParameter": "#4EC9B0",
+            
+            // Functions and methods
+            "function": "#DCDCAA",
+            "function.declaration": "#DCDCAA",
+            "*.function": "#DCDCAA",
+            "method": "#DCDCAA",
+            "method.declaration": "#DCDCAA",
+            "*.method": "#DCDCAA",
+            
+            // Variables and parameters
+            "variable": "#9CDCFE",
+            "variable.declaration": "#9CDCFE",
+            "variable.readonly": "#4FC1FF",
+            "parameter": "#9CDCFE",
+            "parameter.declaration": "#9CDCFE",
+            
+            // Properties and attributes
+            "property": "#9CDCFE",
+            "property.declaration": "#9CDCFE",
+            "*.property": "#9CDCFE",
+            
+            // Constants and enums
+            "variable.readonly.defaultLibrary": "#4FC1FF",
+            "enumMember": "#4FC1FF",
+            
+            // Modules and namespaces
+            "namespace": "#4EC9B0",
+            "module": "#4EC9B0",
+            
+            // Decorators
+            "decorator": "#DCDCAA",
+            "*.decorator": "#DCDCAA"
+        }
+    },
+    
+    // TextMate token customizations (syntax highlighting)
+    "editor.tokenColorCustomizations": {
+        "textMateRules": [
+            // Keywords
+            {
+                "scope": [
+                    "keyword.control.python",
+                    "keyword.operator.logical.python",
+                    "keyword.other.python",
+                    "storage.type.python"
+                ],
+                "settings": {
+                    "foreground": "#C586C0"
+                }
+            },
+            
+            // Import keywords
+            {
+                "scope": [
+                    "keyword.control.import.python",
+                    "keyword.control.flow.python"
+                ],
+                "settings": {
+                    "foreground": "#C586C0"
+                }
+            },
+            
+            // Built-in functions and constants
+            {
+                "scope": [
+                    "support.function.builtin.python",
+                    "constant.language.python"
+                ],
+                "settings": {
+                    "foreground": "#569CD6"
+                }
+            },
+            
+            // Classes
+            {
+                "scope": [
+                    "entity.name.type.class.python",
+                    "entity.name.type.python"
+                ],
+                "settings": {
+                    "foreground": "#4EC9B0"
+                }
+            },
+            
+            // Functions and methods
+            {
+                "scope": [
+                    "entity.name.function.python",
+                    "meta.function-call.python"
+                ],
+                "settings": {
+                    "foreground": "#DCDCAA"
+                }
+            },
+            
+            // Strings
+            {
+                "scope": [
+                    "string.quoted.single.python",
+                    "string.quoted.double.python",
+                    "string.quoted.triple.python"
+                ],
+                "settings": {
+                    "foreground": "#CE9178"
+                }
+            },
+            
+            // String formatting
+            {
+                "scope": [
+                    "constant.character.format.placeholder.other.python",
+                    "meta.fstring.python"
+                ],
+                "settings": {
+                    "foreground": "#D7BA7D"
+                }
+            },
+            
+            // Comments
+            {
+                "scope": "comment.line.number-sign.python",
+                "settings": {
+                    "foreground": "#6A9955",
+                    "fontStyle": "italic"
+                }
+            },
+            
+            // Docstrings
+            {
+                "scope": "string.quoted.docstring.multi.python",
+                "settings": {
+                    "foreground": "#6A9955",
+                    "fontStyle": "italic"
+                }
+            },
+            
+            // Numbers
+            {
+                "scope": [
+                    "constant.numeric.python",
+                    "constant.numeric.integer.python",
+                    "constant.numeric.float.python",
+                    "constant.numeric.complex.python"
+                ],
+                "settings": {
+                    "foreground": "#B5CEA8"
+                }
+            },
+            
+            // Operators
+            {
+                "scope": [
+                    "keyword.operator.python",
+                    "keyword.operator.arithmetic.python",
+                    "keyword.operator.comparison.python",
+                    "keyword.operator.assignment.python"
+                ],
+                "settings": {
+                    "foreground": "#D4D4D4"
+                }
+            },
+            
+            // Self parameter
+            {
+                "scope": "variable.language.self.python",
+                "settings": {
+                    "foreground": "#569CD6",
+                    "fontStyle": "italic"
+                }
+            },
+            
+            // Magic methods
+            {
+                "scope": "support.function.magic.python",
+                "settings": {
+                    "foreground": "#DCDCAA"
+                }
+            },
+            
+            // Decorators
+            {
+                "scope": [
+                    "entity.name.function.decorator.python",
+                    "meta.function.decorator.python"
+                ],
+                "settings": {
+                    "foreground": "#C586C0"
+                }
+            },
+            
+            // Exception classes
+            {
+                "scope": "support.type.exception.python",
+                "settings": {
+                    "foreground": "#4EC9B0"
+                }
+            },
+            
+            // Type hints
+            {
+                "scope": [
+                    "meta.function.parameters.python",
+                    "meta.function.type.python"
+                ],
+                "settings": {
+                    "foreground": "#4EC9B0"
+                }
+            },
+            
+            // Variables
+            {
+                "scope": [
+                    "variable.other.python",
+                    "variable.parameter.python"
+                ],
+                "settings": {
+                    "foreground": "#9CDCFE"
+                }
+            },
+            
+            // Module names
+            {
+                "scope": "entity.name.namespace.python",
+                "settings": {
+                    "foreground": "#C586C0"
+                }
+            },
+            
+            // Punctuation
+            {
+                "scope": [
+                    "punctuation.definition.string.python",
+                    "punctuation.separator.python"
+                ],
+                "settings": {
+                    "foreground": "#D4D4D4"
+                }
+            }
+        ]
+    },
+    "[plaintext]": {
+        "editor.wordWrap": "off"
+    }
+}
