@@ -6,15 +6,19 @@ import os
 import torch
 import torch.distributed as dist
 import torch.nn.utils
-from datetime import datetime
+from datetime import datetime, timedelta
+import signal
+import sys
 
 # Set tokenizers parallelism to false to avoid fork warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# Set NCCL timeout to prevent hanging
+os.environ["NCCL_TIMEOUT"] = "300"  # 5 minutes
+os.environ["NCCL_BLOCKING_WAIT"] = "1"
+
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy, FSDPModule, ShardingStrategy, BackwardPrefetch
 from torch.distributed.device_mesh import init_device_mesh
-
-# FSDP2 uses distributed checkpoint APIs directly - no need for FSDP1 state dict imports
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.optimization import get_linear_schedule_with_warmup
@@ -24,41 +28,54 @@ from functools import partial
 from tqdm import tqdm
 from model import LoRAModel
 from parameter_dataset import CodeParametersDataset, CodeParametersDatasetFromDict, ParameterExample, SampleDict
-from checkpoint import FSDP2Checkpointer
+from checkpoint import FSDP2Checkpointer, safe_checkpoint_save
 
 from utils import print_memory_stats, setup_seed
 # endregion
 
 
 tokenizer = None  # Will be initialized after fork
+graceful_shutdown = False
 
 
-def get_tokenizer(model_name):
-    """Get or create tokenizer instance."""
-    global tokenizer
-    if tokenizer is None:
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-    return tokenizer
+def signal_handler(signum, frame):
+    """Handle graceful shutdown on SIGTERM/SIGINT"""
+    global graceful_shutdown
+    rank = int(os.environ.get("LOCAL_RANK", 0))
+    if rank == 0:
+        print(f"\nReceived signal {signum}, initiating graceful shutdown...")
+    graceful_shutdown = True
 
 
 def setup():
-    """Initialize the distributed environment."""
+    """Initialize the distributed environment with timeout protection."""
     rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     
-    # Initialize process group
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    # Setup signal handlers for graceful shutdown
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    # Initialize process group with timeout
+    try:
+        dist.init_process_group(
+            "nccl", 
+            rank=rank, 
+            world_size=world_size,
+            timeout=timedelta(seconds=300)  # 5 minute timeout
+        )
+    except Exception as e:
+        print(f"Failed to initialize process group: {e}")
+        sys.exit(1)
     
     # Set device
     torch.cuda.set_device(rank)
     
-    # Limit memory usage to 80% of GPU memory
-    # torch.cuda.set_per_process_memory_fraction(0.8)
+    # Clear cache
     torch.cuda.empty_cache()
     
     return rank, world_size
+
 
 
 def setup_memory_snapshot(enabled=True):
@@ -97,60 +114,6 @@ def dump_memory_snapshot(step, prefix="memory_snapshot"):
         print(f"❌ Failed to save memory snapshot: {e}")
 
 
-def monitor_memory(step, log_every=10):
-    """Monitor memory usage across all ranks"""
-    if step % log_every != 0:
-        return
-        
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    
-    # Get memory stats for current rank
-    allocated = torch.cuda.memory_allocated() / 1024**3
-    reserved = torch.cuda.memory_reserved() / 1024**3
-    max_allocated = torch.cuda.max_memory_allocated() / 1024**3
-    max_reserved = torch.cuda.max_memory_reserved() / 1024**3
-    
-    # Collect memory stats from all ranks
-    memory_stats = torch.tensor([allocated, reserved, max_allocated, max_reserved], 
-                               device=torch.cuda.current_device())
-    
-    # Gather from all ranks
-    all_stats = [torch.zeros_like(memory_stats) for _ in range(world_size)]
-    dist.all_gather(all_stats, memory_stats)
-    
-    if rank == 0:
-        print(f"\nStep {step} - Memory Usage Across All Ranks:")
-        print("-" * 60)
-        
-        total_allocated = 0
-        total_reserved = 0
-        max_peak_allocated = 0
-        max_peak_reserved = 0
-        
-        for i, stats in enumerate(all_stats):
-            alloc, res, max_alloc, max_res = stats.cpu().numpy()
-            total_allocated += alloc
-            total_reserved += res
-            max_peak_allocated = max(max_peak_allocated, max_alloc)
-            max_peak_reserved = max(max_peak_reserved, max_res)
-            
-            print(f"GPU {i}: {alloc:.2f}GB alloc, {res:.2f}GB reserved, "
-                  f"peak: {max_alloc:.2f}GB/{max_res:.2f}GB")
-        
-        print(f"TOTAL: {total_allocated:.2f}GB allocated, {total_reserved:.2f}GB reserved")
-        print(f"PEAKS: {max_peak_allocated:.2f}GB allocated, {max_peak_reserved:.2f}GB reserved")
-        print("-" * 60)
-        
-        # Check for potential OOM risk
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        if total_reserved > gpu_memory * world_size * 0.9:
-            print("⚠️  WARNING: High memory usage detected!")
-        
-        # Force cleanup if any GPU is using too much reserved memory
-        if max_peak_reserved > gpu_memory * 0.95:
-            print("🧹 Forcing memory cleanup due to high reserved memory")
-            torch.cuda.empty_cache()
 
 
 def get_training_args():
@@ -163,10 +126,6 @@ def get_training_args():
         "activation_checkpointing": True,
     }
 
-
-def cleanup():
-    """Clean up the distributed environment."""
-    dist.destroy_process_group()
 
 
 def get_fsdp_memory_breakdown(model):
@@ -264,14 +223,6 @@ def safe_batch_size_test(model, tokenizer, current_batch_size, max_length):
     
     print(f"🎯 Recommended safe batch size: {safe_batch_size}")
     return safe_batch_size
-
-
-# Cast all model parameters to bfloat16 before FSDP wrapping
-def cast_model_to_dtype(model, dtype):
-    for param in model.parameters():
-        param.data = param.data.to(dtype)
-    for buffer in model.buffers():
-        buffer.data = buffer.data.to(dtype)
 
 
 def estimate_memory_usage(model, batch_size, seq_length, vocab_size):
@@ -395,40 +346,47 @@ def validate_memory_before_training(model, args):
 
 
 def apply_fsdp2_to_model(model, args, world_size):
-    """Apply FSDP2 to model using new APIs"""
+    """Apply FSDP2 to model using new APIs with better error handling"""
     
-    # Create device mesh
-    device_mesh = init_device_mesh("cuda", (world_size,))
-    
-    # Configure mixed precision if requested
-    mp_policy = None
-    if getattr(args, 'mixed_precision', False):
-        mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-        )
-    
-    # Apply FSDP2 to transformer layers first
-    for name, module in model.named_modules():
-        if isinstance(module, Starcoder2DecoderLayer):
-            fully_shard(
-                module,
-                mesh=device_mesh,
-                mp_policy=mp_policy,
+    try:
+        # Create device mesh
+        device_mesh = init_device_mesh("cuda", (world_size,))
+        
+        # Configure mixed precision if requested
+        mp_policy = None
+        if getattr(args, 'mixed_precision', False):
+            mp_policy = MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.bfloat16,
             )
-    
-    # Apply FSDP2 to entire model
-    fully_shard(
-        model,
-        mesh=device_mesh, 
-        mp_policy=mp_policy,
-    )
-    
-    return model
+        
+        # Apply FSDP2 to transformer layers first
+        for name, module in model.named_modules():
+            if isinstance(module, Starcoder2DecoderLayer):
+                fully_shard(
+                    module,
+                    mesh=device_mesh,
+                    mp_policy=mp_policy,
+                )
+        
+        # Apply FSDP2 to entire model
+        fully_shard(
+            model,
+            mesh=device_mesh, 
+            mp_policy=mp_policy,
+        )
+        
+        return model
+        
+    except Exception as e:
+        rank = int(os.environ.get("LOCAL_RANK", 0))
+        if rank == 0:
+            print(f"Error applying FSDP2: {e}")
+        raise e
 
 
-def train_epoch_with_accumulation(model, dataloader, optimizer, scheduler, epoch, rank, args):
-    """Training with gradient accumulation"""
+def train_epoch_with_accumulation(model, dataloader, optimizer, scheduler, epoch, rank, args, checkpointer):
+    """Training with gradient accumulation and improved checkpoint handling"""
     model.train()
     total_loss = 0
     accumulation_steps = getattr(args, 'gradient_accumulation_steps', 1)
@@ -439,13 +397,31 @@ def train_epoch_with_accumulation(model, dataloader, optimizer, scheduler, epoch
     if rank == 0:
         torch.cuda.reset_peak_memory_stats()
     
+    checkpoint_saved = False
+    
     for step, batch in enumerate(dataloader):
+        # Check for graceful shutdown
+        if graceful_shutdown:
+            if rank == 0:
+                print("Graceful shutdown requested, saving checkpoint...")
+            
+            if not checkpoint_saved:
+                metadata = {
+                    "epoch": epoch,
+                    "step": step,
+                    "partial_epoch": True,
+                    "model_name": args.model_name,
+                    "lora_rank": args.lora_rank,
+                    "lora_alpha": args.lora_alpha,
+                    "target_modules": args.target_modules,
+                }
+                safe_checkpoint_save(checkpointer, model, optimizer, metadata, max_retries=1)
+                checkpoint_saved = True
+            
+            return total_loss / max(1, step)
+        
         if step == 0 or step % 20 == 0:
             monitor_memory(step, log_every=1)
-
-        # if step > 40:
-        #     dist.destroy_process_group()
-        #     exit()
 
         # Only move tensor items to CUDA
         batch = {
@@ -469,16 +445,61 @@ def train_epoch_with_accumulation(model, dataloader, optimizer, scheduler, epoch
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
+                
+                # Clear cache periodically
+                if (step + 1) % (accumulation_steps * 4) == 0:
+                    torch.cuda.empty_cache()
             
             total_loss += loss.item() * accumulation_steps
             
             if step in [5, 10, 15, 20]:
                 dump_memory_snapshot(step)
 
+            # Emergency checkpoint save if memory is getting high
+            if step > 0 and step % 50 == 0:
+                peak_memory = torch.cuda.max_memory_allocated() / (1024**3)
+                gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                
+                    
+                if peak_memory > gpu_memory * 0.9:  # 90% usage
+                    if rank == 0:
+                        print(f"High memory usage detected ({peak_memory:.1f}GB), saving emergency checkpoint...")
+                    
+                    metadata = {
+                        "epoch": epoch,
+                        "step": step,
+                        "emergency_save": True,
+                        "model_name": args.model_name,
+                        "lora_rank": args.lora_rank,
+                        "lora_alpha": args.lora_alpha,
+                        "target_modules": args.target_modules,
+                    }
+                    safe_checkpoint_save(checkpointer, model, optimizer, metadata, max_retries=1)
+                    
+                    # Clear cache after emergency save
+                    torch.cuda.empty_cache()
+
         except RuntimeError as e:
             if "out of memory" in str(e):
-                print(f"  OOM at step {step}, batch size {len(batch['input_ids'])}")
+                if rank == 0:
+                    print(f"OOM at step {step}, batch size {len(batch['input_ids'])}")
                 monitor_memory(step, log_every=1)
+                
+                # Try to save emergency checkpoint before failing
+                try:
+                    metadata = {
+                        "epoch": epoch,
+                        "step": step,
+                        "oom_error": True,
+                        "model_name": args.model_name,
+                        "lora_rank": args.lora_rank,
+                        "lora_alpha": args.lora_alpha,
+                        "target_modules": args.target_modules,
+                    }
+                    safe_checkpoint_save(checkpointer, model, optimizer, metadata, max_retries=1)
+                except:
+                    pass  # Don't fail if emergency save fails
+                
                 raise e
             else:
                 raise e
@@ -491,54 +512,62 @@ def train_epoch_with_accumulation(model, dataloader, optimizer, scheduler, epoch
     return total_loss / len(dataloader)
 
 
-def print_model_shapes(model, rank):
-    """Print shapes of model and its layers."""
-    if rank != 0:
+def monitor_memory(step, log_every=10):
+    """Monitor memory usage with improved error handling"""
+    if step % log_every != 0:
         return
         
-    print("\nModel Architecture and Shapes:")
-    print("=" * 50)
-    
-    # Print overall model shape
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\nTotal parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-    print(f"Trainable %: {(trainable_params/total_params)*100:.4f}")
-    
-    # Print shapes of each module
-    print("\nLayer Shapes:")
-    print("-" * 50)
-    for name, module in model.named_modules():
-        if hasattr(module, 'weight'):
-            if hasattr(module.weight, 'shape'):
-                print(f"{name}:")
-                print(f"  Weight shape: {module.weight.shape}")
-                if hasattr(module, 'bias') and module.bias is not None:
-                    print(f"  Bias shape: {module.bias.shape}")
-                if hasattr(module, 'in_features'):
-                    print(f"  Input features: {module.in_features}")
-                if hasattr(module, 'out_features'):
-                    print(f"  Output features: {module.out_features}")
-                print()
-    
-    # Print input/output shapes for key layers
-    print("\nKey Layer Shapes:")
-    print("-" * 50)
-    for name, module in model.named_modules():
-        if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
-            print(f"{name}:")
-            if isinstance(module, torch.nn.Linear):
-                print(f"  Input features: {module.in_features}")
-                print(f"  Output features: {module.out_features}")
-                print(f"  Weight shape: {module.weight.shape}")
-                if module.bias is not None:
-                    print(f"  Bias shape: {module.bias.shape}")
-            elif isinstance(module, torch.nn.Embedding):
-                print(f"  Vocab size: {module.num_embeddings}")
-                print(f"  Embedding dim: {module.embedding_dim}")
-                print(f"  Weight shape: {module.weight.shape}")
-            print()
+    try:
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        
+        # Get memory stats for current rank
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+        max_reserved = torch.cuda.max_memory_reserved() / 1024**3
+        
+        if rank == 0:
+            print(f"Step {step} - Rank 0 Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, peak: {max_allocated:.2f}GB")
+            
+            # Check for potential OOM risk
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            if reserved > gpu_memory * 0.85:
+                print("Warning: High memory usage detected!")
+                torch.cuda.empty_cache()
+                
+    except Exception as e:
+        # Don't fail training if memory monitoring fails
+        pass
+
+
+def cleanup():
+    """Clean up the distributed environment with timeout protection."""
+    try:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+    except Exception as e:
+        rank = int(os.environ.get("LOCAL_RANK", 0))
+        if rank == 0:
+            print(f"Warning: Failed to destroy process group cleanly: {e}")
+
+
+def get_tokenizer(model_name):
+    """Get or create tokenizer instance."""
+    global tokenizer
+    if tokenizer is None:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
+def cast_model_to_dtype(model, dtype):
+    """Cast all model parameters to specified dtype"""
+    for param in model.parameters():
+        param.data = param.data.to(dtype)
+    for buffer in model.buffers():
+        buffer.data = buffer.data.to(dtype)
 
 
 def get_data_collator(tokenizer):
@@ -561,82 +590,6 @@ def get_data_collator(tokenizer):
             'context': contexts
         }
     return collate_fn
-
-
-def safe_peft_checkpoint_save(model, checkpoint_dir, metadata):
-    """Safely save PEFT checkpoint using FSDP2 compatible methods"""
-    
-    rank = int(os.environ.get("LOCAL_RANK", 0))
-    if rank != 0:
-        return True
-    
-    try:
-        from pathlib import Path
-        peft_dir = Path(checkpoint_dir) / "peft"
-        peft_dir.mkdir(exist_ok=True)
-        
-        # FSDP2 approach: extract from named_parameters
-        lora_weights = {}
-        
-        for name, param in model.named_parameters():
-            # Look for LoRA-specific parameter names
-            if any(lora_key in name for lora_key in ['lora_A', 'lora_B', 'lora_embedding_A', 'lora_embedding_B']):
-                clean_name = name
-                for prefix in ['_fsdp_wrapped_module.', 'module.', '_orig_mod.']:
-                    clean_name = clean_name.replace(prefix, '')
-                
-                # Safely extract parameter data
-                try:
-                    param_data = param.detach()
-                    if param_data.is_cuda:
-                        param_data = param_data.cpu()
-                    lora_weights[clean_name] = param_data.clone()
-                except Exception as e:
-                    print(f"Warning: Could not extract parameter {name}: {e}")
-                    continue
-        
-        if not lora_weights:
-            print("Warning: No LoRA weights found for PEFT checkpoint")
-            return False
-        
-        # Create adapter config
-        adapter_config = {
-            "auto_mapping": None,
-            "base_model_name_or_path": metadata.get('model_name', 'bigcode/starcoder2-7b'),
-            "bias": "none",
-            "fan_in_fan_out": False,
-            "inference_mode": True,
-            "init_lora_weights": True,
-            "layers_pattern": None,
-            "layers_to_transform": None,
-            "lora_alpha": float(metadata.get('lora_alpha', 16)),
-            "lora_dropout": 0.0,
-            "modules_to_save": None,
-            "peft_type": "LORA",
-            "r": int(metadata.get('lora_rank', 16)),
-            "revision": None,
-            "target_modules": metadata.get('target_modules', ["q_proj", "v_proj", "k_proj", "o_proj"]),
-            "task_type": "CAUSAL_LM"
-        }
-        
-        # Save config
-        import json
-        with open(peft_dir / "adapter_config.json", 'w') as f:
-            json.dump(adapter_config, f, indent=2)
-        
-        # Save weights
-        try:
-            from safetensors.torch import save_file
-            save_file(lora_weights, peft_dir / "adapter_model.safetensors")
-        except ImportError:
-            torch.save(lora_weights, peft_dir / "adapter_model.bin")
-        
-        print(f"✓ PEFT checkpoint saved successfully to: {peft_dir}")
-        return True
-        
-    except Exception as e:
-        print(f"Error saving PEFT checkpoint: {e}")
-        return False
 
 
 def main(args):
@@ -740,21 +693,12 @@ def main(args):
                 "Please add more examples or reduce batch size."
             )
     
-    # Print model shapes
-    # print_model_shapes(model, rank)
-    
-    if rank == 0:
-        print(f"\nModel configuration:")
-        print(f"Input shape: {args.max_length}")
-        print(f"Batch size: {args.batch_size}")
-        print(f"World size: {world_size}")
-        print(f"Hidden size: {base_model.config.hidden_size}")
-        print(f"Vocab size: {base_model.config.vocab_size}")
-        print(f"Number of layers: {base_model.config.num_hidden_layers}")
-        print(f"Number of attention heads: {base_model.config.num_attention_heads}")
-    
-    # Initialize checkpointer
-    checkpointer = FSDP2Checkpointer(args.checkpoint_dir, save_peft_format=True)
+    # Initialize checkpointer with shorter timeout
+    checkpointer = FSDP2Checkpointer(
+        args.checkpoint_dir, 
+        save_peft_format=True,
+        checkpoint_timeout=300  # 5 minutes timeout
+    )
     
     # Initialize optimizer (only for trainable parameters)
     optimizer = torch.optim.AdamW(
@@ -776,7 +720,6 @@ def main(args):
     elif rank == 0 and args.no_resume:
         print("Skipping checkpoint loading as --no-resume was specified")
     
-    
     # Initialize scheduler
     total_steps = len(dataloader) * args.num_epochs
     scheduler = get_linear_schedule_with_warmup(
@@ -794,80 +737,115 @@ def main(args):
         print(f"Batch size: {args.batch_size}")
         print(f"World size: {world_size}")
         
-    # Validate memory before training
-    validate_memory_before_training(model, args)
-    
-    for epoch in range(args.num_epochs):
-        # Set epoch for sampler
-        sampler.set_epoch(epoch)
-        
-        # Train for one epoch
-        avg_loss = train_epoch_with_accumulation(
-            model,
-            dataloader,
-            optimizer,
-            scheduler,
-            epoch + 1,
-            rank,
-            args,
-        )
-        
-        if rank == 0:
-            print(f"Epoch {epoch + 1} - Average Loss: {avg_loss:.4f}")
-        
-        # Save checkpoint
-        if (epoch + 1) % args.save_every == 0:
+    try:
+        for epoch in range(args.num_epochs):
+            # Check for graceful shutdown
+            if graceful_shutdown:
+                if rank == 0:
+                    print("Graceful shutdown requested, breaking training loop")
+                break
+            
+            # Set epoch for sampler
+            sampler.set_epoch(epoch)
+            
+            # Train for one epoch
+            avg_loss = train_epoch_with_accumulation(
+                model,
+                dataloader,
+                optimizer,
+                scheduler,
+                epoch + 1,
+                rank,
+                args,
+                checkpointer,
+            )
+            
             if rank == 0:
-                print(f"Saving checkpoint at epoch {epoch + 1}")
+                print(f"Epoch {epoch + 1} - Average Loss: {avg_loss:.4f}")
+            
+            # Save checkpoint with improved error handling
+            if (epoch + 1) % args.save_every == 0:
+                if rank == 0:
+                    print(f"Saving checkpoint at epoch {epoch + 1}")
+                
+                metadata = {
+                    "epoch": epoch + 1,
+                    "avg_loss": avg_loss,
+                    "model_name": args.model_name,
+                    "lora_rank": args.lora_rank,
+                    "lora_alpha": args.lora_alpha,
+                    "target_modules": args.target_modules,
+                }
+                
+                # Use safe checkpoint save with retries
+                success = safe_checkpoint_save(checkpointer, model, optimizer, metadata)
+                if not success and rank == 0:
+                    print("Warning: Checkpoint save failed, continuing training...")
+                
+                # Cleanup old checkpoints
+                if rank == 0:
+                    try:
+                        checkpointer.cleanup_old_checkpoints(keep_last_n=3)
+                    except Exception as e:
+                        print(f"Warning: Failed to cleanup old checkpoints: {e}")
+        
+        # Final checkpoint
+        if not graceful_shutdown and (epoch + 1) % args.save_every != 0:
+            if rank == 0:
+                print("Saving final checkpoint")
             
             metadata = {
-                "epoch": epoch + 1,
-                "avg_loss": avg_loss,
+                "epoch": args.num_epochs,
+                "model_name": args.model_name,
+                "lora_rank": args.lora_rank,
+                "lora_alpha": args.lora_alpha,
+                "target_modules": args.target_modules,
+                "final": True,
+            }
+            
+            safe_checkpoint_save(checkpointer, model, optimizer, metadata)
+            
+            if rank == 0:
+                try:
+                    checkpointer.cleanup_old_checkpoints(keep_last_n=3)
+                except Exception as e:
+                    print(f"Warning: Failed to cleanup old checkpoints: {e}")
+
+    except KeyboardInterrupt:
+        if rank == 0:
+            print("\nTraining interrupted by user")
+        # Save emergency checkpoint
+        metadata = {
+            "epoch": epoch + 1 if 'epoch' in locals() else 0,
+            "interrupted": True,
+            "model_name": args.model_name,
+            "lora_rank": args.lora_rank,
+            "lora_alpha": args.lora_alpha,
+            "target_modules": args.target_modules,
+        }
+        safe_checkpoint_save(checkpointer, model, optimizer, metadata, max_retries=1)
+        
+    except Exception as e:
+        if rank == 0:
+            print(f"Training failed with error: {e}")
+        # Save emergency checkpoint
+        try:
+            metadata = {
+                "epoch": epoch + 1 if 'epoch' in locals() else 0,
+                "error": str(e),
                 "model_name": args.model_name,
                 "lora_rank": args.lora_rank,
                 "lora_alpha": args.lora_alpha,
                 "target_modules": args.target_modules,
             }
-            
-            # Save main checkpoint
-            checkpointer.save(model, optimizer, metadata)
-            
-            # Try safe PEFT save as backup
-            if rank == 0:
-                safe_peft_checkpoint_save(model, checkpointer.get_latest_checkpoint(), metadata)
-            
-            # Cleanup old checkpoints
-            if rank == 0:
-                checkpointer.cleanup_old_checkpoints(keep_last_n=3)
+            safe_checkpoint_save(checkpointer, model, optimizer, metadata, max_retries=1)
+        except:
+            pass  # Don't fail if emergency save fails
+        raise e
     
-    # Final checkpoint
-    if (epoch + 1) % args.save_every != 0:
-        if rank == 0:
-            print("Saving final checkpoint")
-        
-        metadata = {
-            "epoch": args.num_epochs,
-            "model_name": args.model_name,
-            "lora_rank": args.lora_rank,
-            "lora_alpha": args.lora_alpha,
-            "target_modules": args.target_modules,
-            "final": True,
-        }
-        
-        checkpointer.save(model, optimizer, metadata)
-        
-        # Try safe PEFT save as backup
-        if rank == 0:
-            safe_peft_checkpoint_save(model, checkpointer.get_latest_checkpoint(), metadata)
-        
-        checkpointer.cleanup_old_checkpoints(keep_last_n=3)
-
-    if rank == 0:
-        dump_memory_snapshot("final")
-        torch.cuda.memory._record_memory_history(enabled=None)
-
-    # Cleanup
-    cleanup()
+    finally:
+        # Always try to cleanup
+        cleanup()
     
     if rank == 0:
         print("Training completed!")

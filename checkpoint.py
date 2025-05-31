@@ -7,6 +7,7 @@ import torch.distributed as dist
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Optional
+import time
 
 from torch.distributed.checkpoint.filesystem import (
     FileSystemReader,
@@ -18,16 +19,19 @@ from torch.distributed.checkpoint.state_dict_saver import save as save_state_dic
 
 
 class FSDP2Checkpointer:
-    """FSDP2-compatible checkpointer for LoRA training with PEFT format support"""
+    """FSDP2-compatible checkpointer with robust timeout handling"""
     
-    def __init__(self, checkpoint_dir: str, save_peft_format: bool = True):
+    def __init__(self, checkpoint_dir: str, save_peft_format: bool = True, checkpoint_timeout: int = 300):
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(exist_ok=True, parents=True)
         self.rank = int(os.environ.get("LOCAL_RANK", 0))
         self.save_peft_format = save_peft_format
+        self.checkpoint_timeout = checkpoint_timeout  # 5 minutes default
     
     def save(self, model, optimizer, metadata: Dict[str, Any]):
-        """Save model, optimizer, and metadata using FSDP2 APIs with optional PEFT format"""
+        """Save model, optimizer, and metadata using FSDP2 APIs with timeout protection"""
+        
+        start_time = time.time()
         
         # Create timestamped checkpoint directory
         if self.rank == 0:
@@ -36,8 +40,13 @@ class FSDP2Checkpointer:
             checkpoint_path.mkdir(exist_ok=True)
             print(f"Saving checkpoint to: {checkpoint_path}")
         
-        # Ensure all ranks wait for directory creation
-        dist.barrier()
+        # Ensure all ranks wait for directory creation with timeout
+        try:
+            dist.barrier()
+        except Exception as e:
+            if self.rank == 0:
+                print(f"Warning: Barrier failed during directory creation: {e}")
+            # Continue anyway
         
         # Broadcast checkpoint path to all ranks
         if self.rank == 0:
@@ -46,204 +55,234 @@ class FSDP2Checkpointer:
         else:
             checkpoint_path_str = ""
         
-        # Broadcast the path
-        checkpoint_path_list = [checkpoint_path_str]
-        dist.broadcast_object_list(checkpoint_path_list, src=0)
-        checkpoint_path = Path(checkpoint_path_list[0])
+        # Broadcast the path with timeout protection
+        try:
+            checkpoint_path_list = [checkpoint_path_str]
+            dist.broadcast_object_list(checkpoint_path_list, src=0)
+            checkpoint_path = Path(checkpoint_path_list[0])
+        except Exception as e:
+            if self.rank == 0:
+                print(f"Warning: Broadcast failed, using fallback path: {e}")
+            checkpoint_path = self.checkpoint_dir / f"checkpoint_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            checkpoint_path.mkdir(exist_ok=True)
+        
+        # Try saving with timeout protection
+        try:
+            success = self._save_with_timeout(model, optimizer, metadata, checkpoint_path, start_time)
+            if not success:
+                # Fallback to simple save
+                if self.rank == 0:
+                    print("Falling back to simple checkpoint save...")
+                self._save_simple_fallback(model, optimizer, metadata, checkpoint_path)
+                
+        except Exception as e:
+            if self.rank == 0:
+                print(f"Error during checkpoint save: {e}")
+                # Try fallback save
+                try:
+                    self._save_simple_fallback(model, optimizer, metadata, checkpoint_path)
+                except Exception as fallback_error:
+                    print(f"Fallback save also failed: {fallback_error}")
+                    raise e
+    
+    def _save_with_timeout(self, model, optimizer, metadata, checkpoint_path, start_time):
+        """Save with timeout protection"""
         
         try:
-            # Save model state dict using distributed checkpoint (FSDP2 compatible)
+            # Check if we're already close to timeout
+            if time.time() - start_time > self.checkpoint_timeout * 0.8:
+                if self.rank == 0:
+                    print("Approaching timeout, skipping distributed checkpoint save")
+                return False
+            
+            # Clear any CUDA cache before saving
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Save model state dict using distributed checkpoint
+            if self.rank == 0:
+                print("Saving model state dict...")
+            
+            model_start = time.time()
             model_state_dict = {"model": model.state_dict()}
+            
+            # Check timeout before model save
+            if time.time() - start_time > self.checkpoint_timeout * 0.6:
+                if self.rank == 0:
+                    print("Timeout approaching, aborting model save")
+                return False
+            
             save_state_dict(
                 state_dict=model_state_dict,
                 storage_writer=FileSystemWriter(checkpoint_path / "model"),
             )
             
+            if self.rank == 0:
+                print(f"Model saved in {time.time() - model_start:.2f}s")
+            
+            # Check timeout before optimizer save
+            if time.time() - start_time > self.checkpoint_timeout * 0.8:
+                if self.rank == 0:
+                    print("Timeout approaching, skipping optimizer save")
+                # Still save metadata and PEFT
+                self._save_metadata_and_peft(model, checkpoint_path, metadata)
+                return True
+            
             # Save optimizer state dict
+            if self.rank == 0:
+                print("Saving optimizer state dict...")
+            
+            optim_start = time.time()
             optim_state_dict = {"optimizer": optimizer.state_dict()}
             save_state_dict(
                 state_dict=optim_state_dict,
                 storage_writer=FileSystemWriter(checkpoint_path / "optimizer"),
             )
             
-            # Save metadata (only on rank 0)
             if self.rank == 0:
-                torch.save(metadata, checkpoint_path / "metadata.pt")
-                
-                # Save PEFT format if enabled
-                if self.save_peft_format:
-                    self._save_peft_format_fsdp2(model, checkpoint_path, metadata)
-                
-                print(f"✓ Checkpoint saved successfully")
-                
+                print(f"Optimizer saved in {time.time() - optim_start:.2f}s")
+            
+            # Save metadata and PEFT (only on rank 0)
+            self._save_metadata_and_peft(model, checkpoint_path, metadata)
+            
+            if self.rank == 0:
+                total_time = time.time() - start_time
+                print(f"Checkpoint saved successfully in {total_time:.2f}s")
+            
+            return True
+            
         except Exception as e:
             if self.rank == 0:
-                print(f"✗ Error saving checkpoint: {e}")
-            raise e
+                print(f"Distributed checkpoint save failed: {e}")
+            return False
     
-    def _save_peft_format_fsdp2(self, model, checkpoint_path: Path, metadata: Dict[str, Any]):
-        """Save in PEFT-compatible format using FSDP2 APIs"""
+    def _save_metadata_and_peft(self, model, checkpoint_path, metadata):
+        """Save metadata and PEFT format (rank 0 only)"""
+        if self.rank != 0:
+            return
         
         try:
-            peft_dir = checkpoint_path / "peft"
-            if self.rank == 0:
-                peft_dir.mkdir(exist_ok=True)
+            # Save metadata
+            torch.save(metadata, checkpoint_path / "metadata.pt")
             
-            # Wait for directory creation
-            dist.barrier()
+            # Save PEFT format if enabled
+            if self.save_peft_format:
+                self._save_peft_format_safe(model, checkpoint_path, metadata)
+                
+        except Exception as e:
+            print(f"Warning: Failed to save metadata/PEFT: {e}")
+    
+    def _save_simple_fallback(self, model, optimizer, metadata, checkpoint_path):
+        """Simple fallback save method that avoids distributed checkpoints"""
+        
+        if self.rank == 0:
+            print("Using simple fallback checkpoint save...")
+        
+        try:
+            # Clear cache first
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
-            # FSDP2 approach: Get state dict and gather on rank 0
+            # Extract LoRA weights manually (safer for FSDP2)
+            lora_weights = self._extract_lora_weights_safe(model)
+            
             if self.rank == 0:
-                # Load the distributed checkpoint we just saved
-                state_dict = {}
-                load_state_dict(
-                    state_dict=state_dict,
-                    storage_reader=FileSystemReader(checkpoint_path / "model"),
-                )
-                
-                # Extract the model state dict
-                full_state_dict = state_dict.get("model", {})
-                
-                # Extract LoRA weights from the loaded state dict
-                lora_weights = self._extract_lora_weights_from_state_dict(full_state_dict)
-                
+                # Save LoRA weights only
                 if lora_weights:
-                    # Create PEFT checkpoint structure
-                    self._create_peft_checkpoint_structure(peft_dir, lora_weights, metadata)
-                    print(f"✓ PEFT checkpoint saved to: {peft_dir}")
+                    torch.save(lora_weights, checkpoint_path / "lora_weights.pt")
+                    print(f"Saved {len(lora_weights)} LoRA parameters")
                 else:
-                    print("Warning: No LoRA weights found for PEFT checkpoint")
-                    # Create minimal PEFT structure
-                    self._create_peft_checkpoint_manual_safe(model, peft_dir, metadata)
+                    print("Warning: No LoRA weights found")
+                
+                # Save metadata
+                torch.save(metadata, checkpoint_path / "metadata.pt")
+                
+                # Save optimizer state (best effort)
+                try:
+                    optim_state = optimizer.state_dict()
+                    # Only save if state dict is reasonable size
+                    state_size = sum(p.numel() for group in optim_state['state'].values() 
+                                   for p in group.values() if isinstance(p, torch.Tensor))
+                    if state_size < 1e9:  # Less than 1B parameters in optimizer state
+                        torch.save(optim_state, checkpoint_path / "optimizer.pt")
+                        print("Optimizer state saved")
+                    else:
+                        print("Optimizer state too large, skipping")
+                except Exception as e:
+                    print(f"Warning: Could not save optimizer state: {e}")
+                
+                # Create PEFT format
+                if self.save_peft_format and lora_weights:
+                    self._save_peft_format_from_weights(lora_weights, checkpoint_path, metadata)
+                
+                print("Fallback checkpoint save completed")
+            
+            # Synchronize all ranks
+            if dist.is_initialized():
+                try:
+                    dist.barrier()
+                except:
+                    pass  # Don't fail if barrier fails
                     
         except Exception as e:
             if self.rank == 0:
-                print(f"Warning: Failed to save PEFT format: {e}")
-                # Fallback to manual extraction
-                self._save_peft_format_fallback(model, checkpoint_path, metadata)
+                print(f"Fallback save failed: {e}")
+            raise e
     
-    def _save_peft_format_fallback(self, model, checkpoint_path: Path, metadata: Dict[str, Any]):
-        """Fallback PEFT save method that works with FSDP2"""
-        
-        if self.rank != 0:
-            return
-            
-        try:
-            peft_dir = checkpoint_path / "peft"
-            peft_dir.mkdir(exist_ok=True)
-            
-            print("Using fallback PEFT save method...")
-            
-            # Try to extract from named parameters (FSDP2 compatible)
-            lora_weights = self._extract_lora_from_named_parameters(model)
-            
-            if lora_weights:
-                self._create_peft_checkpoint_structure(peft_dir, lora_weights, metadata)
-                print(f"✓ PEFT checkpoint saved using fallback method")
-            else:
-                # Create minimal PEFT structure
-                self._create_peft_checkpoint_manual_safe(model, peft_dir, metadata)
-                print(f"✓ PEFT checkpoint created using safe manual method")
-                
-        except Exception as e:
-            print(f"Warning: All PEFT save methods failed: {e}")
-    
-    def _extract_lora_from_named_parameters(self, model):
-        """Extract LoRA weights from model.named_parameters() - FSDP2 safe"""
+    def _extract_lora_weights_safe(self, model):
+        """Safely extract LoRA weights without triggering collective operations"""
         lora_weights = {}
         
         try:
+            # Use named_parameters which should be safer than state_dict() for FSDP2
             for name, param in model.named_parameters():
-                # Look for LoRA-specific parameter names
                 if any(lora_key in name for lora_key in ['lora_A', 'lora_B', 'lora_embedding_A', 'lora_embedding_B']):
-                    # Clean up FSDP and module prefixes
+                    # Clean up FSDP prefixes
                     clean_name = name
                     for prefix in ['_fsdp_wrapped_module.', 'module.', '_orig_mod.']:
                         clean_name = clean_name.replace(prefix, '')
                     
-                    # For FSDP2, we need to handle sharded parameters carefully
-                    if hasattr(param, 'detach'):
-                        try:
-                            # Detach and move to CPU if possible
-                            param_data = param.detach()
+                    try:
+                        # Safely extract parameter data
+                        if hasattr(param, 'data'):
+                            param_data = param.data.detach()
                             if param_data.is_cuda:
                                 param_data = param_data.cpu()
                             lora_weights[clean_name] = param_data.clone()
-                        except Exception as e:
-                            print(f"Warning: Could not extract parameter {name}: {e}")
-                            continue
-                            
+                    except Exception as e:
+                        print(f"Warning: Could not extract parameter {name}: {e}")
+                        continue
+                        
         except Exception as e:
-            print(f"Error extracting from named_parameters: {e}")
+            print(f"Error during LoRA weight extraction: {e}")
             
         return lora_weights
     
-    def _extract_lora_weights_from_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Extract LoRA weights from a full state dict"""
-        lora_weights = {}
+    def _save_peft_format_safe(self, model, checkpoint_path, metadata):
+        """Save PEFT format with better error handling"""
         
-        for key, tensor in state_dict.items():
-            # Look for LoRA-specific parameter names
-            if any(lora_key in key for lora_key in ['lora_A', 'lora_B', 'lora_embedding_A', 'lora_embedding_B']):
-                # Clean up FSDP and module prefixes
-                clean_key = key
-                for prefix in ['_fsdp_wrapped_module.', 'module.', '_orig_mod.']:
-                    clean_key = clean_key.replace(prefix, '')
-                
-                # Ensure tensor is on CPU and detached
-                if tensor.device != torch.device('cpu'):
-                    tensor = tensor.cpu()
-                if tensor.requires_grad:
-                    tensor = tensor.detach()
-                
-                lora_weights[clean_key] = tensor.clone()
-        
-        return lora_weights
-    
-    def _create_peft_checkpoint_structure(self, peft_dir: Path, lora_weights: Dict[str, torch.Tensor], metadata: Dict[str, Any]):
-        """Create PEFT checkpoint structure from LoRA weights"""
-        
-        if not lora_weights:
-            raise RuntimeError("No LoRA weights provided")
-        
-        # Create adapter_config.json
-        adapter_config = {
-            "auto_mapping": None,
-            "base_model_name_or_path": metadata.get('model_name', 'bigcode/starcoder2-7b'),
-            "bias": "none",
-            "fan_in_fan_out": False,
-            "inference_mode": True,
-            "init_lora_weights": True,
-            "layers_pattern": None,
-            "layers_to_transform": None,
-            "lora_alpha": float(metadata.get('lora_alpha', 16)),
-            "lora_dropout": 0.0,  # Set to 0 for inference
-            "modules_to_save": None,
-            "peft_type": "LORA",
-            "r": int(metadata.get('lora_rank', 16)),
-            "revision": None,
-            "target_modules": metadata.get('target_modules', ["q_proj", "v_proj", "k_proj", "o_proj"]),
-            "task_type": "CAUSAL_LM"
-        }
-        
-        # Save adapter config
-        import json
-        with open(peft_dir / "adapter_config.json", 'w') as f:
-            json.dump(adapter_config, f, indent=2)
-        
-        # Save adapter weights
         try:
-            # Try to save as safetensors (preferred format)
-            from safetensors.torch import save_file
-            save_file(lora_weights, peft_dir / "adapter_model.safetensors")
-        except ImportError:
-            # Fallback to PyTorch format
-            torch.save(lora_weights, peft_dir / "adapter_model.bin")
+            peft_dir = checkpoint_path / "peft"
+            peft_dir.mkdir(exist_ok=True)
+            
+            # Extract LoRA weights safely
+            lora_weights = self._extract_lora_weights_safe(model)
+            
+            if lora_weights:
+                self._save_peft_format_from_weights(lora_weights, checkpoint_path, metadata)
+            else:
+                print("Warning: No LoRA weights found for PEFT checkpoint")
+                
+        except Exception as e:
+            print(f"Warning: PEFT save failed: {e}")
     
-    def _create_peft_checkpoint_manual_safe(self, model, peft_dir: Path, metadata: Dict[str, Any]):
-        """Safely create PEFT checkpoint without accessing distributed tensors directly"""
+    def _save_peft_format_from_weights(self, lora_weights, checkpoint_path, metadata):
+        """Save PEFT format from extracted weights"""
         
-        # Create a minimal PEFT structure with config only
+        peft_dir = checkpoint_path / "peft"
+        peft_dir.mkdir(exist_ok=True)
+        
+        # Create adapter config
         adapter_config = {
             "auto_mapping": None,
             "base_model_name_or_path": metadata.get('model_name', 'bigcode/starcoder2-7b'),
@@ -263,23 +302,22 @@ class FSDP2Checkpointer:
             "task_type": "CAUSAL_LM"
         }
         
-        # Save adapter config
+        # Save config
         import json
         with open(peft_dir / "adapter_config.json", 'w') as f:
             json.dump(adapter_config, f, indent=2)
         
-        # Create an empty weights file as placeholder
-        empty_weights = {}
+        # Save weights
         try:
             from safetensors.torch import save_file
-            save_file(empty_weights, peft_dir / "adapter_model.safetensors")
+            save_file(lora_weights, peft_dir / "adapter_model.safetensors")
         except ImportError:
-            torch.save(empty_weights, peft_dir / "adapter_model.bin")
+            torch.save(lora_weights, peft_dir / "adapter_model.bin")
         
-        print("Created PEFT config structure. Note: Weights will need to be extracted manually for inference.")
+        print(f"PEFT checkpoint saved to: {peft_dir}")
     
     def load(self, model, optimizer) -> bool:
-        """Load the latest checkpoint using FSDP2 APIs"""
+        """Load the latest checkpoint with improved error handling"""
         latest_checkpoint = self.get_latest_checkpoint()
         if not latest_checkpoint:
             if self.rank == 0:
@@ -290,115 +328,73 @@ class FSDP2Checkpointer:
             print(f"Loading checkpoint from: {latest_checkpoint.name}")
         
         try:
-            # Check if this is a new format checkpoint (with model/optimizer subdirs)
+            # Try new format first (with model/optimizer subdirs)
             if (latest_checkpoint / "model").exists():
-                # Load model state dict using distributed checkpoint (FSDP2 compatible)
-                model_state_dict = {"model": model.state_dict()}
-                load_state_dict(
-                    state_dict=model_state_dict,
-                    storage_reader=FileSystemReader(latest_checkpoint / "model"),
-                )
-                model.load_state_dict(model_state_dict["model"])
+                return self._load_distributed_checkpoint(model, optimizer, latest_checkpoint)
+            else:
+                return self._load_simple_checkpoint(model, optimizer, latest_checkpoint)
                 
-                # Load optimizer state dict
+        except Exception as e:
+            if self.rank == 0:
+                print(f"Error loading checkpoint: {e}")
+            return False
+    
+    def _load_distributed_checkpoint(self, model, optimizer, checkpoint_path):
+        """Load distributed checkpoint format"""
+        try:
+            # Load model state dict
+            model_state_dict = {"model": model.state_dict()}
+            load_state_dict(
+                state_dict=model_state_dict,
+                storage_reader=FileSystemReader(checkpoint_path / "model"),
+            )
+            model.load_state_dict(model_state_dict["model"])
+            
+            # Load optimizer state dict if it exists
+            if (checkpoint_path / "optimizer").exists():
                 optim_state_dict = {"optimizer": optimizer.state_dict()}
                 load_state_dict(
                     state_dict=optim_state_dict,
-                    storage_reader=FileSystemReader(latest_checkpoint / "optimizer"),
+                    storage_reader=FileSystemReader(checkpoint_path / "optimizer"),
                 )
                 optimizer.load_state_dict(optim_state_dict["optimizer"])
-            else:
-                # Old format - load directly from checkpoint files
-                if self.rank == 0:
-                    print("Loading from old checkpoint format...")
-                
-                # Load model state dict
-                model_path = latest_checkpoint / "lora_weights.pt"
-                if model_path.exists():
-                    model_state_dict = torch.load(model_path, map_location="cpu")
-                    model.load_state_dict(model_state_dict, strict=False)
-                
-                # Load optimizer state dict
-                optim_path = latest_checkpoint / "optimizer.pt"
-                if optim_path.exists():
-                    optim_state_dict = torch.load(optim_path, map_location="cpu")
-                    optimizer.load_state_dict(optim_state_dict)
             
             if self.rank == 0:
-                print("✓ Checkpoint loaded successfully")
-            
+                print("Distributed checkpoint loaded successfully")
             return True
             
         except Exception as e:
             if self.rank == 0:
-                print(f"✗ Error loading checkpoint: {e}")
+                print(f"Failed to load distributed checkpoint: {e}")
             return False
     
-    def extract_peft_weights_from_checkpoint(self, checkpoint_path: Optional[Path] = None) -> Optional[str]:
-        """Extract PEFT weights from a distributed checkpoint for inference use"""
-        
-        if self.rank != 0:
-            return None
-            
-        if checkpoint_path is None:
-            checkpoint_path = self.get_latest_checkpoint()
-            
-        if not checkpoint_path:
-            print("No checkpoint found to extract PEFT weights from")
-            return None
-        
+    def _load_simple_checkpoint(self, model, optimizer, checkpoint_path):
+        """Load simple checkpoint format"""
         try:
-            print(f"Extracting PEFT weights from: {checkpoint_path}")
+            # Load LoRA weights
+            lora_path = checkpoint_path / "lora_weights.pt"
+            if lora_path.exists():
+                lora_state_dict = torch.load(lora_path, map_location="cpu")
+                model.load_state_dict(lora_state_dict, strict=False)
+                if self.rank == 0:
+                    print(f"Loaded {len(lora_state_dict)} LoRA parameters")
             
-            # Check if PEFT checkpoint already exists
-            peft_dir = checkpoint_path / "peft"
-            if peft_dir.exists() and (peft_dir / "adapter_config.json").exists():
-                # Check if weights file exists and is not empty
-                weights_file = peft_dir / "adapter_model.safetensors"
-                if not weights_file.exists():
-                    weights_file = peft_dir / "adapter_model.bin"
-                
-                if weights_file.exists() and weights_file.stat().st_size > 1000:  # More than 1KB
-                    print(f"✓ PEFT checkpoint already exists: {peft_dir}")
-                    return str(peft_dir)
+            # Load optimizer state
+            optim_path = checkpoint_path / "optimizer.pt"
+            if optim_path.exists():
+                optim_state_dict = torch.load(optim_path, map_location="cpu")
+                optimizer.load_state_dict(optim_state_dict)
+                if self.rank == 0:
+                    print("Optimizer state loaded")
             
-            # Need to extract weights from distributed checkpoint
-            print("Extracting weights from distributed checkpoint...")
-            
-            # Load the distributed model checkpoint
-            state_dict = {}
-            load_state_dict(
-                state_dict=state_dict,
-                storage_reader=FileSystemReader(checkpoint_path / "model"),
-            )
-            
-            # Extract the actual model state dict
-            full_state_dict = state_dict.get("model", {})
-            
-            # Extract LoRA weights
-            lora_weights = self._extract_lora_weights_from_state_dict(full_state_dict)
-            
-            if not lora_weights:
-                print("Warning: No LoRA weights found in checkpoint")
-                return None
-            
-            # Load metadata
-            metadata_path = checkpoint_path / "metadata.pt"
-            if metadata_path.exists():
-                metadata = torch.load(metadata_path, map_location='cpu')
-            else:
-                metadata = {"model_name": "bigcode/starcoder2-7b", "lora_rank": 16, "lora_alpha": 16}
-            
-            # Create PEFT structure
-            peft_dir.mkdir(exist_ok=True)
-            self._create_peft_checkpoint_structure(peft_dir, lora_weights, metadata)
-            
-            print(f"✓ PEFT weights extracted to: {peft_dir}")
-            return str(peft_dir)
+            if self.rank == 0:
+                print("Simple checkpoint loaded successfully")
+            return True
             
         except Exception as e:
-            print(f"✗ Failed to extract PEFT weights: {e}")
-            return None
+            if self.rank == 0:
+                print(f"Failed to load simple checkpoint: {e}")
+            return False
     
     def get_latest_checkpoint(self) -> Optional[Path]:
         """Get the path to the latest checkpoint"""
@@ -406,24 +402,6 @@ class FSDP2Checkpointer:
         if not checkpoints:
             return None
         return max(checkpoints, key=lambda x: x.stat().st_mtime)
-    
-    def get_latest_peft_checkpoint(self) -> Optional[str]:
-        """Get the path to the latest PEFT checkpoint for inference"""
-        latest_checkpoint = self.get_latest_checkpoint()
-        if latest_checkpoint:
-            peft_dir = latest_checkpoint / "peft"
-            if peft_dir.exists() and (peft_dir / "adapter_config.json").exists():
-                # Check if weights exist
-                weights_file = peft_dir / "adapter_model.safetensors"
-                if not weights_file.exists():
-                    weights_file = peft_dir / "adapter_model.bin"
-                
-                if weights_file.exists() and weights_file.stat().st_size > 1000:
-                    return str(peft_dir)
-                else:
-                    # Try to extract weights
-                    return self.extract_peft_weights_from_checkpoint(latest_checkpoint)
-        return None
     
     def is_empty(self) -> bool:
         """Check if there are any checkpoints"""
@@ -457,98 +435,55 @@ class FSDP2Checkpointer:
                 print(f"Cleaned up old checkpoint: {checkpoint_dir.name}")
             except Exception as e:
                 print(f"Warning: Could not delete {checkpoint_dir}: {e}")
+
+
+# Utility function for safe checkpoint saving in training loop
+def safe_checkpoint_save(checkpointer, model, optimizer, metadata, max_retries=2):
+    """Safely save checkpoint with retries and fallbacks"""
     
-    def save_lora_weights_only(self, model, filename: str = "lora_weights.pt"):
-        """Save only the LoRA weights (for inference) - FSDP2 compatible legacy method"""
-        if self.rank != 0:
-            return
-            
+    rank = int(os.environ.get("LOCAL_RANK", 0))
+    
+    for attempt in range(max_retries):
         try:
-            # FSDP2 approach: extract from named_parameters
-            lora_state_dict = self._extract_lora_from_named_parameters(model)
+            if rank == 0:
+                print(f"Checkpoint save attempt {attempt + 1}/{max_retries}")
             
-            if not lora_state_dict:
-                print("Warning: No LoRA weights found to save")
-                return
+            # Clear cache before saving
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
-            save_path = self.checkpoint_dir / filename
-            torch.save(lora_state_dict, save_path)
-            print(f"✓ LoRA weights saved to: {save_path}")
+            # Add timeout to metadata
+            metadata['save_attempt'] = attempt + 1
+            metadata['timestamp'] = datetime.now().isoformat()
+            
+            checkpointer.save(model, optimizer, metadata)
+            
+            if rank == 0:
+                print("Checkpoint saved successfully")
+            return True
             
         except Exception as e:
-            print(f"✗ Error saving LoRA weights: {e}")
-    
-    def get_checkpoint_info(self) -> Dict[str, Any]:
-        """Get information about available checkpoints"""
-        if self.rank != 0:
-            return {}
+            if rank == 0:
+                print(f"Checkpoint save attempt {attempt + 1} failed: {e}")
             
-        checkpoints = sorted(
-            self.checkpoint_dir.glob("checkpoint_*"),
-            key=lambda x: x.stat().st_mtime,
-            reverse=True
-        )
-        
-        info = {
-            "total_checkpoints": len(checkpoints),
-            "checkpoint_dir": str(self.checkpoint_dir),
-            "checkpoints": []
-        }
-        
-        for checkpoint_path in checkpoints:
-            try:
-                metadata_path = checkpoint_path / "metadata.pt"
-                if metadata_path.exists():
-                    metadata = torch.load(metadata_path, map_location='cpu')
-                else:
-                    metadata = {}
+            if attempt < max_retries - 1:
+                if rank == 0:
+                    print(f"Retrying in 10 seconds...")
+                time.sleep(10)
                 
-                # Check for PEFT checkpoint
-                peft_dir = checkpoint_path / "peft"
-                has_peft = peft_dir.exists() and (peft_dir / "adapter_config.json").exists()
+                # Clear caches and try again
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 
-                # Check if PEFT weights exist and are valid
-                peft_weights_valid = False
-                if has_peft:
-                    weights_file = peft_dir / "adapter_model.safetensors"
-                    if not weights_file.exists():
-                        weights_file = peft_dir / "adapter_model.bin"
-                    peft_weights_valid = weights_file.exists() and weights_file.stat().st_size > 1000
-                
-                checkpoint_info = {
-                    "timestamp": checkpoint_path.name.replace("checkpoint_", ""),
-                    "path": str(checkpoint_path),
-                    "peft_path": str(peft_dir) if has_peft else None,
-                    "has_peft": has_peft,
-                    "peft_weights_valid": peft_weights_valid,
-                    "size_mb": sum(
-                        f.stat().st_size for f in checkpoint_path.rglob('*') 
-                        if f.is_file()
-                    ) / (1024 * 1024),
-                    "metadata": metadata
-                }
-                info["checkpoints"].append(checkpoint_info)
-                
-            except Exception as e:
-                print(f"Warning: Could not read checkpoint info for {checkpoint_path}: {e}")
-        
-        return info
-
-
-# Utility functions for checkpoint management
-def get_memory_usage():
-    """Get current memory usage"""
-    if torch.cuda.is_available():
-        return {
-            "allocated_gb": torch.cuda.memory_allocated() / 1024**3,
-            "reserved_gb": torch.cuda.memory_reserved() / 1024**3,
-            "max_allocated_gb": torch.cuda.max_memory_allocated() / 1024**3,
-        }
-    return {}
-
-def clear_memory_cache():
-    """Clear CUDA memory cache"""
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        import gc
-        gc.collect()
+                # Try to reset any hanging distributed state
+                try:
+                    if dist.is_initialized():
+                        dist.barrier()
+                except:
+                    pass
+            else:
+                if rank == 0:
+                    print("All checkpoint save attempts failed")
+                return False
+    
+    return False

@@ -170,4 +170,5 @@ cython_debug/
 # .vscode/settings.json
 
 checkpoints/
+snapshots/
 optuna_study.db
