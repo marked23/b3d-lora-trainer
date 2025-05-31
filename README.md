@@ -1,6 +1,8 @@
 
-This is my take on the official PyTorch FSDP2 example found here:</br>
-[https://github.com/pytorch/examples/tree/main/distributed/FSDP2](https://github.com/pytorch/examples/tree/main/distributed/FSDP2)
+This is my first attempt to train a LoRA.
+I'm trying to augment a coder model to improve completion accuracy for a specific python library called [build123d](https://github.com/gumyr/build123d)
+
+
 
 The original example has some lint I wanted to clean up.  This project will serve as my template for creating other trainers that take advantage of FSDP2. 
 
@@ -10,39 +12,9 @@ I use AMD GPUs. The requirements.txt will install the ROCm specific PyTorch from
 - PyTorch 2.6
 - ROCm 6.4.1
 
-What does it do when you run it?</br>
-It creates a useless model out of thin air (random inputs).
-```bash
-(.venv) mark@wide:~/prog/fsdp2-minimal-rocm$ ./dotrain.sh 
-FSDPTransformer(
-  (tok_embeddings): Embedding(1024, 16)
-  (pos_embeddings): Embedding(64, 16)
-  (dropout): Dropout(p=0, inplace=False)
-  (layers): ModuleList(
-    (0-9): 10 x FSDPTransformerBlock(
-      (attention_norm): LayerNorm((16,), eps=1e-05, elementwise_affine=True)
-      (attention): Attention(
-        (resid_dropout): Dropout(p=0, inplace=False)
-        (wq): Linear(in_features=16, out_features=16, bias=False)
-        (wk): Linear(in_features=16, out_features=16, bias=False)
-        (wv): Linear(in_features=16, out_features=16, bias=False)
-        (wo): Linear(in_features=16, out_features=16, bias=False)
-      )
-      (ffn_norm): LayerNorm((16,), eps=1e-05, elementwise_affine=True)
-      (feed_forward): FeedForward(
-        (w1): Linear(in_features=16, out_features=64, bias=True)
-        (gelu): GELU(approximate='none')
-        (w2): Linear(in_features=64, out_features=16, bias=True)
-        (resid_dropout): Dropout(p=0, inplace=False)
-      )
-    )
-  )
-  (norm): LayerNorm((16,), eps=1e-05, elementwise_affine=True)
-  (output): Linear(in_features=16, out_features=1024, bias=False)
-)
-... then a bunch of warnings about AOTriton, which you can ignore.
-```
 
+I used [https://github.com/pytorch/examples/tree/main/distributed/FSDP2](https://github.com/pytorch/examples/tree/main/distributed/FSDP2)
+as my starting point, but it's probably unrecognizable now that Claude has had her way with it.
 Original README below
 ***
 ***
