@@ -1,4 +1,4 @@
-# z_train.py
+# train.py
 
 import argparse
 import os
@@ -19,11 +19,11 @@ from transformers.models.starcoder2.modeling_starcoder2 import Starcoder2Decoder
 from torch.utils.data import DataLoader, DistributedSampler
 from functools import partial
 from tqdm import tqdm
-from z_model import LoRAModel
-from z_parameter_dataset import CodeParametersDataset, CodeParametersDatasetFromDict, ParameterExample, SampleDict
-from z_checkpoint import FSDP2Checkpointer
+from model import LoRAModel
+from parameter_dataset import CodeParametersDataset, CodeParametersDatasetFromDict, ParameterExample, SampleDict
+from checkpoint import FSDP2Checkpointer
 
-from z_utils import print_memory_stats, setup_seed
+from utils import print_memory_stats, setup_seed
 
 # Initialize tokenizer with parallelism enabled
 tokenizer = None  # Will be initialized after fork

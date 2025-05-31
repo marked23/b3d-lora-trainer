@@ -41,7 +41,7 @@ torchrun \
     --standalone \
     --nproc_per_node=$NUM_GPUS \
     --master_port=29500 \
-    z_train.py \
+    train.py \
     --model-name $MODEL_NAME \
     --batch-size $BATCH_SIZE \
     --learning-rate $LEARNING_RATE \

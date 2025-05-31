@@ -1,4 +1,4 @@
-# z_checkpoint.py
+# checkpoint.py
 
 import os
 import torch
