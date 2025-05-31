@@ -1,17 +1,20 @@
 # train.py
 
+# region imports
 import argparse
 import os
 import torch
 import torch.distributed as dist
 import torch.nn.utils
+from datetime import datetime
 
 # Set tokenizers parallelism to false to avoid fork warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy, FSDPModule
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy, FSDPModule, ShardingStrategy, BackwardPrefetch
 from torch.distributed.device_mesh import init_device_mesh
 
+# FSDP2 uses distributed checkpoint APIs directly - no need for FSDP1 state dict imports
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.optimization import get_linear_schedule_with_warmup
@@ -24,9 +27,11 @@ from parameter_dataset import CodeParametersDataset, CodeParametersDatasetFromDi
 from checkpoint import FSDP2Checkpointer
 
 from utils import print_memory_stats, setup_seed
+# endregion
 
-# Initialize tokenizer with parallelism enabled
+
 tokenizer = None  # Will be initialized after fork
+
 
 def get_tokenizer(model_name):
     """Get or create tokenizer instance."""
@@ -36,6 +41,7 @@ def get_tokenizer(model_name):
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
     return tokenizer
+
 
 def setup():
     """Initialize the distributed environment."""
@@ -48,18 +54,105 @@ def setup():
     # Set device
     torch.cuda.set_device(rank)
     
+    # Limit memory usage to 80% of GPU memory
+    # torch.cuda.set_per_process_memory_fraction(0.8)
+    torch.cuda.empty_cache()
+    
     return rank, world_size
 
 
-def monitor_memory(rank, step):
-    """Monitor memory usage"""
-    if rank == 0 and step % 10 == 0:
-        allocated = torch.cuda.memory_allocated() / 1024**3
-        reserved = torch.cuda.memory_reserved() / 1024**3
-        print(f"Step {step}: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+def setup_memory_snapshot(enabled=True):
+    """Setup memory snapshot recording with minimal overhead"""
+    if not enabled:
+        return
+    
+    os.makedirs("snapshots", exist_ok=True)
+
+    # Only rank 0 needs to setup snapshots to avoid conflicts
+    rank = int(os.environ.get("LOCAL_RANK", 0))
+    if rank == 0:
+        print("🔍 Memory snapshot recording enabled")
+        torch.cuda.memory._record_memory_history(
+            max_entries=100000,  # Keep last 100k alloc/free events
+            # context="all"      # Uncomment for stack traces (adds overhead)
+        )
 
 
-# Updated training configuration
+def dump_memory_snapshot(step, prefix="memory_snapshot"):
+    """Dump memory snapshot to file"""
+    rank = int(os.environ.get("LOCAL_RANK", 0))
+    if rank != 0:
+        return
+    
+    try:
+        # Create unique filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"snapshots/{prefix}_step_{step}_{timestamp}.pkl"
+        
+        print(f"💾 Saving memory snapshot: {filename}")
+        torch.cuda.memory._dump_snapshot(filename)
+        print(f"✅ Snapshot saved. View at: https://pytorch.org/memory_viz")
+        
+    except Exception as e:
+        print(f"❌ Failed to save memory snapshot: {e}")
+
+
+def monitor_memory(step, log_every=10):
+    """Monitor memory usage across all ranks"""
+    if step % log_every != 0:
+        return
+        
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    
+    # Get memory stats for current rank
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+    max_reserved = torch.cuda.max_memory_reserved() / 1024**3
+    
+    # Collect memory stats from all ranks
+    memory_stats = torch.tensor([allocated, reserved, max_allocated, max_reserved], 
+                               device=torch.cuda.current_device())
+    
+    # Gather from all ranks
+    all_stats = [torch.zeros_like(memory_stats) for _ in range(world_size)]
+    dist.all_gather(all_stats, memory_stats)
+    
+    if rank == 0:
+        print(f"\nStep {step} - Memory Usage Across All Ranks:")
+        print("-" * 60)
+        
+        total_allocated = 0
+        total_reserved = 0
+        max_peak_allocated = 0
+        max_peak_reserved = 0
+        
+        for i, stats in enumerate(all_stats):
+            alloc, res, max_alloc, max_res = stats.cpu().numpy()
+            total_allocated += alloc
+            total_reserved += res
+            max_peak_allocated = max(max_peak_allocated, max_alloc)
+            max_peak_reserved = max(max_peak_reserved, max_res)
+            
+            print(f"GPU {i}: {alloc:.2f}GB alloc, {res:.2f}GB reserved, "
+                  f"peak: {max_alloc:.2f}GB/{max_res:.2f}GB")
+        
+        print(f"TOTAL: {total_allocated:.2f}GB allocated, {total_reserved:.2f}GB reserved")
+        print(f"PEAKS: {max_peak_allocated:.2f}GB allocated, {max_peak_reserved:.2f}GB reserved")
+        print("-" * 60)
+        
+        # Check for potential OOM risk
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        if total_reserved > gpu_memory * world_size * 0.9:
+            print("⚠️  WARNING: High memory usage detected!")
+        
+        # Force cleanup if any GPU is using too much reserved memory
+        if max_peak_reserved > gpu_memory * 0.95:
+            print("🧹 Forcing memory cleanup due to high reserved memory")
+            torch.cuda.empty_cache()
+
+
 def get_training_args():
     """Get memory-efficient training arguments"""
     return {
@@ -76,12 +169,110 @@ def cleanup():
     dist.destroy_process_group()
 
 
+def get_fsdp_memory_breakdown(model):
+    """Get detailed FSDP memory breakdown"""
+    rank = dist.get_rank()
+    
+    if rank != 0:
+        return
+    
+    print("\nFSDP Memory Breakdown:")
+    print("-" * 40)
+    
+    # Count parameters by type
+    total_params = 0
+    lora_params = 0
+    base_params = 0
+    
+    for name, param in model.named_parameters():
+        param_count = param.numel()
+        total_params += param_count
+        
+        if 'lora' in name.lower():
+            lora_params += param_count
+        else:
+            base_params += param_count
+    
+    print(f"Total parameters: {total_params:,}")
+    print(f"LoRA parameters: {lora_params:,} ({lora_params/total_params*100:.2f}%)")
+    print(f"Base parameters: {base_params:,} ({base_params/total_params*100:.2f}%)")
+    
+    # Memory estimates (bfloat16 = 2 bytes per param)
+    total_param_memory = total_params * 2 / 1024**3
+    lora_param_memory = lora_params * 2 / 1024**3
+    
+    print(f"\nParameter Memory (bfloat16):")
+    print(f"Total: {total_param_memory:.2f} GB")
+    print(f"LoRA: {lora_param_memory:.2f} GB")
+    print(f"Per GPU (sharded): {total_param_memory / dist.get_world_size():.2f} GB")
+
+
+def safe_batch_size_test(model, tokenizer, current_batch_size, max_length):
+    """Test different batch sizes to find the maximum safe size"""
+    rank = dist.get_rank()
+    
+    if rank != 0:
+        return current_batch_size
+    
+    print("\n🧪 Testing safe batch sizes...")
+    
+    # Reset memory stats
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.empty_cache()
+    
+    test_sizes = [current_batch_size, current_batch_size * 2, current_batch_size * 4]
+    safe_batch_size = current_batch_size
+    
+    for test_size in test_sizes:
+        try:
+            print(f"Testing batch size {test_size}...")
+            
+            # Create dummy batch
+            dummy_input = torch.randint(0, tokenizer.vocab_size, 
+                                      (test_size, max_length), 
+                                      device=torch.cuda.current_device())
+            
+            dummy_attention = torch.ones_like(dummy_input)
+            
+            # Test forward pass
+            with torch.no_grad():
+                outputs = model(input_ids=dummy_input, attention_mask=dummy_attention)
+            
+            # Check memory usage
+            peak_memory = torch.cuda.max_memory_allocated() / 1024**3
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            
+            print(f"  Peak memory: {peak_memory:.2f}GB / {gpu_memory:.2f}GB ({peak_memory/gpu_memory*100:.1f}%)")
+            
+            if peak_memory < gpu_memory * 0.8:  # 80% threshold
+                safe_batch_size = test_size
+                print(f"  ✅ Safe at batch size {test_size}")
+            else:
+                print(f"  ❌ Too high memory usage at batch size {test_size}")
+                break
+                
+            # Cleanup
+            del dummy_input, dummy_attention, outputs
+            torch.cuda.empty_cache()
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"  💥 OOM at batch size {test_size}")
+                break
+            else:
+                raise e
+    
+    print(f"🎯 Recommended safe batch size: {safe_batch_size}")
+    return safe_batch_size
+
+
 # Cast all model parameters to bfloat16 before FSDP wrapping
 def cast_model_to_dtype(model, dtype):
     for param in model.parameters():
         param.data = param.data.to(dtype)
     for buffer in model.buffers():
         buffer.data = buffer.data.to(dtype)
+
 
 def estimate_memory_usage(model, batch_size, seq_length, vocab_size):
     """Estimate memory usage for the model"""
@@ -125,6 +316,7 @@ def estimate_memory_usage(model, batch_size, seq_length, vocab_size):
     
     return total_memory_gb
 
+
 def check_gpu_memory():
     """Check current GPU memory usage"""
     for i in range(torch.cuda.device_count()):
@@ -132,6 +324,7 @@ def check_gpu_memory():
         reserved = torch.cuda.memory_reserved(i) / (1024**3)
         total = torch.cuda.get_device_properties(i).total_memory / (1024**3)
         print(f"GPU {i}: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, {total:.2f}GB total")
+
 
 def debug_fsdp_memory_usage(model):
     """Debug FSDP memory usage"""
@@ -150,6 +343,7 @@ def debug_fsdp_memory_usage(model):
         print(f"  Total parameters: {total_params:,}")
         print(f"  Sharded parameters: {sharded_params:,}")
         print(f"  Sharding efficiency: {(sharded_params/total_params)*100:.1f}%")
+
 
 def validate_memory_before_training(model, args):
     """Validate memory requirements before starting training"""
@@ -182,7 +376,7 @@ def validate_memory_before_training(model, args):
         # Provide specific recommendations based on memory analysis
         print(f"\nRecommendations:")
         if memory_headroom < 2.0:
-            print(f"  ⚠️  WARNING: Less than 2GB headroom available!")
+            print(f"     WARNING: Less than 2GB headroom available!")
             if args.batch_size > 1:
                 suggested_batch = max(1, args.batch_size // 2)
                 print(f"  • Consider reducing batch size from {args.batch_size} to {suggested_batch}")
@@ -240,97 +434,61 @@ def train_epoch_with_accumulation(model, dataloader, optimizer, scheduler, epoch
     accumulation_steps = getattr(args, 'gradient_accumulation_steps', 1)
     
     optimizer.zero_grad()
+
+    # Reset peak memory stats at start of epoch
+    if rank == 0:
+        torch.cuda.reset_peak_memory_stats()
     
     for step, batch in enumerate(dataloader):
+        if step == 0 or step % 20 == 0:
+            monitor_memory(step, log_every=1)
+
+        # if step > 40:
+        #     dist.destroy_process_group()
+        #     exit()
+
         # Only move tensor items to CUDA
         batch = {
             k: v.cuda() if isinstance(v, torch.Tensor) else v 
             for k, v in batch.items()
         }
         
-        # Forward pass
-        outputs = model(**batch)
-        loss = outputs.loss / accumulation_steps  # Scale loss
-        
-        # Backward pass
-        loss.backward()
-        
-        # Update every accumulation_steps
-        if (step + 1) % accumulation_steps == 0:
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-
+        try:
+            # Forward pass
+            outputs = model(**batch)
+            loss = outputs.loss / accumulation_steps
             
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-        
-        total_loss += loss.item() * accumulation_steps
-        
-        # Monitor memory
-        monitor_memory(rank, step)
+            # Backward pass
+            loss.backward()
+            
+            # Update every accumulation_steps
+            if (step + 1) % accumulation_steps == 0:
+                if args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+            
+            total_loss += loss.item() * accumulation_steps
+            
+            if step in [5, 10, 15, 20]:
+                dump_memory_snapshot(step)
+
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"  OOM at step {step}, batch size {len(batch['input_ids'])}")
+                monitor_memory(step, log_every=1)
+                raise e
+            else:
+                raise e
+    
+    # Final memory report
+    if rank == 0:
+        peak_memory = torch.cuda.max_memory_allocated() / 1024**3
+        print(f"\nEpoch {epoch} Peak Memory: {peak_memory:.2f} GB")
     
     return total_loss / len(dataloader)
-
-# def train_epoch(
-#     model,
-#     dataloader,
-#     optimizer,
-#     scheduler,
-#     epoch,
-#     rank,
-#     args,
-# ):
-#     """Train for one epoch."""
-#     model.train()
-#     total_loss = 0
-    
-#     # Progress bar only on rank 0
-#     if rank == 0:
-#         pbar = tqdm(total=len(dataloader), desc=f"Epoch {epoch}")
-    
-#     for step, batch in enumerate(dataloader):
-#         # Move batch to device
-#         batch = {k: v.cuda() for k, v in batch.items()}
-        
-#         # Forward pass
-#         outputs = model(**batch)
-#         loss = outputs.loss
-        
-#         # Backward pass
-#         loss.backward()
-        
-#         # Gradient clipping
-#         if args.grad_clip > 0:
-#             model.clip_grad_norm_(args.grad_clip)
-        
-#         # Optimizer step
-#         optimizer.step()
-#         scheduler.step()
-#         optimizer.zero_grad()
-        
-#         # Accumulate loss
-#         total_loss += loss.item()
-        
-#         # Update progress bar
-#         if rank == 0:
-#             pbar.update(1)
-#             pbar.set_postfix({
-#                 "loss": f"{loss.item():.4f}",
-#                 "lr": f"{scheduler.get_last_lr()[0]:.2e}"
-#             })
-        
-#         # Print memory stats periodically
-#         if step % 50 == 0 and rank == 0:
-#             print_memory_stats(rank)
-        
-#         if step % 5 == 0:
-#             torch.cuda.empty_cache()
-    
-#     if rank == 0:
-#         pbar.close()
-    
-#     return total_loss / len(dataloader)
 
 
 def print_model_shapes(model, rank):
@@ -404,12 +562,89 @@ def get_data_collator(tokenizer):
         }
     return collate_fn
 
+
+def safe_peft_checkpoint_save(model, checkpoint_dir, metadata):
+    """Safely save PEFT checkpoint using FSDP2 compatible methods"""
+    
+    rank = int(os.environ.get("LOCAL_RANK", 0))
+    if rank != 0:
+        return True
+    
+    try:
+        from pathlib import Path
+        peft_dir = Path(checkpoint_dir) / "peft"
+        peft_dir.mkdir(exist_ok=True)
+        
+        # FSDP2 approach: extract from named_parameters
+        lora_weights = {}
+        
+        for name, param in model.named_parameters():
+            # Look for LoRA-specific parameter names
+            if any(lora_key in name for lora_key in ['lora_A', 'lora_B', 'lora_embedding_A', 'lora_embedding_B']):
+                clean_name = name
+                for prefix in ['_fsdp_wrapped_module.', 'module.', '_orig_mod.']:
+                    clean_name = clean_name.replace(prefix, '')
+                
+                # Safely extract parameter data
+                try:
+                    param_data = param.detach()
+                    if param_data.is_cuda:
+                        param_data = param_data.cpu()
+                    lora_weights[clean_name] = param_data.clone()
+                except Exception as e:
+                    print(f"Warning: Could not extract parameter {name}: {e}")
+                    continue
+        
+        if not lora_weights:
+            print("Warning: No LoRA weights found for PEFT checkpoint")
+            return False
+        
+        # Create adapter config
+        adapter_config = {
+            "auto_mapping": None,
+            "base_model_name_or_path": metadata.get('model_name', 'bigcode/starcoder2-7b'),
+            "bias": "none",
+            "fan_in_fan_out": False,
+            "inference_mode": True,
+            "init_lora_weights": True,
+            "layers_pattern": None,
+            "layers_to_transform": None,
+            "lora_alpha": float(metadata.get('lora_alpha', 16)),
+            "lora_dropout": 0.0,
+            "modules_to_save": None,
+            "peft_type": "LORA",
+            "r": int(metadata.get('lora_rank', 16)),
+            "revision": None,
+            "target_modules": metadata.get('target_modules', ["q_proj", "v_proj", "k_proj", "o_proj"]),
+            "task_type": "CAUSAL_LM"
+        }
+        
+        # Save config
+        import json
+        with open(peft_dir / "adapter_config.json", 'w') as f:
+            json.dump(adapter_config, f, indent=2)
+        
+        # Save weights
+        try:
+            from safetensors.torch import save_file
+            save_file(lora_weights, peft_dir / "adapter_model.safetensors")
+        except ImportError:
+            torch.save(lora_weights, peft_dir / "adapter_model.bin")
+        
+        print(f"✓ PEFT checkpoint saved successfully to: {peft_dir}")
+        return True
+        
+    except Exception as e:
+        print(f"Error saving PEFT checkpoint: {e}")
+        return False
+
+
 def main(args):
     # Setup distributed training
     rank, world_size = setup()
     setup_seed(42 + rank)
     
-    # Initialize tokenizer after fork
+    # Initialize tokenizer after fork   
     tokenizer = get_tokenizer(args.model_name)
     
     # Load base model first
@@ -519,7 +754,7 @@ def main(args):
         print(f"Number of attention heads: {base_model.config.num_attention_heads}")
     
     # Initialize checkpointer
-    checkpointer = FSDP2Checkpointer(args.checkpoint_dir)
+    checkpointer = FSDP2Checkpointer(args.checkpoint_dir, save_peft_format=True)
     
     # Initialize optimizer (only for trainable parameters)
     optimizer = torch.optim.AdamW(
@@ -550,6 +785,8 @@ def main(args):
         num_training_steps=total_steps,
     )
     
+    setup_memory_snapshot(enabled=True)
+
     # Training loop
     if rank == 0:
         print(f"Starting training for {args.num_epochs} epochs")
@@ -592,14 +829,19 @@ def main(args):
                 "target_modules": args.target_modules,
             }
             
+            # Save main checkpoint
             checkpointer.save(model, optimizer, metadata)
+            
+            # Try safe PEFT save as backup
+            if rank == 0:
+                safe_peft_checkpoint_save(model, checkpointer.get_latest_checkpoint(), metadata)
             
             # Cleanup old checkpoints
             if rank == 0:
                 checkpointer.cleanup_old_checkpoints(keep_last_n=3)
     
     # Final checkpoint
-    if (epoch + 1) % args.save_every == 0:
+    if (epoch + 1) % args.save_every != 0:
         if rank == 0:
             print("Saving final checkpoint")
         
@@ -613,7 +855,16 @@ def main(args):
         }
         
         checkpointer.save(model, optimizer, metadata)
+        
+        # Try safe PEFT save as backup
+        if rank == 0:
+            safe_peft_checkpoint_save(model, checkpointer.get_latest_checkpoint(), metadata)
+        
         checkpointer.cleanup_old_checkpoints(keep_last_n=3)
+
+    if rank == 0:
+        dump_memory_snapshot("final")
+        torch.cuda.memory._record_memory_history(enabled=None)
 
     # Cleanup
     cleanup()
@@ -646,13 +897,13 @@ if __name__ == "__main__":
     )
     
     # Training arguments
-    parser.add_argument("--batch-size", type=int, default=6, help="Batch size per GPU")
-    parser.add_argument("--num-epochs", type=int, default=3, help="Number of epochs")
+    parser.add_argument("--batch-size", type=int, default=1, help="Batch size per GPU")
+    parser.add_argument("--num-epochs", type=int, default=1, help="Number of epochs")
     parser.add_argument("--learning-rate", type=float, default=5e-5, help="Learning rate")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping")
-    parser.add_argument("--max-length", type=int, default=2048, help="Maximum sequence length")
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=8, help="Gradient accumulation steps")
+    parser.add_argument("--max-length", type=int, default=512, help="Maximum sequence length")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=16, help="Gradient accumulation steps")
 
     # Data arguments
     parser.add_argument(

@@ -5,10 +5,10 @@ NUM_GPUS=5
 
 # Training configuration
 MODEL_NAME="bigcode/starcoder2-7b"
-BATCH_SIZE=1
+BATCH_SIZE=2
 LEARNING_RATE=5e-5
 NUM_EPOCHS=3
-MAX_LENGTH=512
+MAX_LENGTH=1536
 
 # LoRA configuration
 LORA_RANK=32
@@ -34,10 +34,10 @@ mkdir -p $OUTPUT_DIR
 # export NCCL_MIN_NCHANNELS=4
 
 # # PyTorch optimizations
-# export OMP_NUM_THREADS=8  # Adjust based on CPU cores
+# export OMP_NUM_THREADS=1  # Adjust based on CPU cores
 
 # Run distributed training
-torchrun \
+OMP_NUM_THREADS=1 torchrun \
     --standalone \
     --nproc_per_node=$NUM_GPUS \
     --master_port=29500 \
@@ -54,4 +54,4 @@ torchrun \
     --mixed-precision \
     --checkpoint-dir $OUTPUT_DIR \
     --save-every 1 \
-    --gradient-accumulation-steps 8
+    --gradient-accumulation-steps 16
