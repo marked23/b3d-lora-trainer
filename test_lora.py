@@ -27,8 +27,14 @@ def find_latest_checkpoint(checkpoint_dir: str = "checkpoints") -> str:
     # Sort by modification time and get the latest
     latest_checkpoint = max(checkpoint_dirs, key=os.path.getmtime)
     
-    print(f"Found latest checkpoint: {latest_checkpoint}")
-    return str(latest_checkpoint)
+    # Check if peft subdirectory exists
+    peft_dir = latest_checkpoint.joinpath("peft")
+    if peft_dir.exists():
+        print(f"Found latest checkpoint: {latest_checkpoint} (using peft subdirectory)")
+        return str(peft_dir)
+    else:
+        print(f"Found latest checkpoint: {latest_checkpoint}")
+        return str(latest_checkpoint)
 
 def quick_test(lora_checkpoint: str, num_tests: int = 3):
     """Run a quick test with a few prompts."""
